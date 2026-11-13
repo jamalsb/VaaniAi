@@ -1,0 +1,908 @@
+import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Play,
+  Pause,
+  Square,
+  Download,
+  Sparkles,
+  Volume2,
+  RotateCcw,
+  Trash2,
+  Loader2,
+  AlertTriangle,
+} from "lucide-react";
+import { LANGUAGES, MAX_TTS_CHARS, STUDIO_VOICES } from "../constants/languages";
+import {
+  ActivePanelActions,
+  PlaybackStatus,
+  ToastVariant,
+  TtsEngine,
+  VoiceGender,
+} from "../types";
+import { WaveformVisualizer } from "./WaveformVisualizer";
+
+interface TextToSpeechPanelProps {
+  text: string;
+  onTextChange: (value: string) => void;
+  languageCode: string;
+  onLanguageChange: (code: string) => void;
+  onNotify: (message: string, variant?: ToastVariant) => void;
+  onSaveHistory: (entry: {
+    mode: "tts";
+    languageCode: string;
+    languageLabel: string;
+    text: string;
+  }) => void;
+  actionsRef?: MutableRefObject<ActivePanelActions | null>;
+}
+
+const FEMALE_NAME_HINTS = [
+  "female",
+  "woman",
+  "samantha",
+  "victoria",
+  "karen",
+  "moira",
+  "tessa",
+  "lekha",
+  "heera",
+  "kalpana",
+  "swara",
+  "neerja",
+  "aditi",
+  "raveena",
+  "zira",
+  "aria",
+  "jenny",
+  "sara",
+  "ava",
+  "allison",
+  "veena",
+];
+
+const MALE_NAME_HINTS = [
+  "male",
+  "man",
+  "daniel",
+  "alex",
+  "rishi",
+  "madhur",
+  "prabhat",
+  "hemant",
+  "david",
+  "mark",
+  "guy",
+  "ryan",
+  "aaron",
+  "fred",
+  "tom",
+  "george",
+];
+
+export function TextToSpeechPanel({
+  text,
+  onTextChange,
+  languageCode,
+  onLanguageChange,
+  onNotify,
+  onSaveHistory,
+  actionsRef,
+}: TextToSpeechPanelProps) {
+  const [engine, setEngine] = useState<TtsEngine>("studio");
+  const [gender, setGender] = useState<VoiceGender>("female");
+  const [studioVoiceId, setStudioVoiceId] = useState<
+    "Kore" | "Zephyr" | "Puck" | "Charon" | "Fenrir"
+  >("Kore");
+  const [browserVoices, setBrowserVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [selectedBrowserVoiceUri, setSelectedBrowserVoiceUri] = useState<string>("");
+  const [speed, setSpeed] = useState<number>(1);
+  const [pitch, setPitch] = useState<number>(1);
+  const [status, setStatus] = useState<PlaybackStatus>("idle");
+  const [isDownloading, setIsDownloading] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const mediaSourceConnectedRef = useRef<boolean>(false);
+  const cachedAudioRef = useRef<{
+    key: string;
+    url: string;
+    base64: string;
+  } | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  const browserSpeechSupported =
+    typeof window !== "undefined" && "speechSynthesis" in window;
+
+  const selectedLanguage = useMemo(
+    () => LANGUAGES.find((l) => l.code === languageCode) ?? LANGUAGES[0],
+    [languageCode]
+  );
+
+  // Sync studio voice when gender changes
+  useEffect(() => {
+    const matching = STUDIO_VOICES.filter((v) => v.gender === gender);
+    if (!matching.some((v) => v.id === studioVoiceId) && matching[0]) {
+      setStudioVoiceId(matching[0].id);
+    }
+  }, [gender, studioVoiceId]);
+
+  // Load browser SpeechSynthesis voices
+  useEffect(() => {
+    if (!browserSpeechSupported) return;
+
+    const loadVoices = () => {
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        setBrowserVoices(voices);
+      }
+    };
+
+    loadVoices();
+    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", loadVoices);
+    };
+  }, [browserSpeechSupported]);
+
+  // Filter browser voices matching language + gender preference
+  const filteredBrowserVoices = useMemo(() => {
+    if (browserVoices.length === 0) return [];
+    const langPrefix = languageCode.split("-")[0].toLowerCase();
+
+    const exactMatches = browserVoices.filter(
+      (v) => v.lang.toLowerCase() === languageCode.toLowerCase()
+    );
+    const prefixMatches = browserVoices.filter((v) =>
+      v.lang.toLowerCase().startsWith(langPrefix)
+    );
+    const pool =
+      exactMatches.length > 0
+        ? exactMatches
+        : prefixMatches.length > 0
+        ? prefixMatches
+        : browserVoices;
+
+    const hints = gender === "female" ? FEMALE_NAME_HINTS : MALE_NAME_HINTS;
+    const genderMatched = pool.filter((v) => {
+      const lower = v.name.toLowerCase();
+      return hints.some((hint) => lower.includes(hint));
+    });
+
+    return genderMatched.length > 0 ? genderMatched : pool;
+  }, [browserVoices, languageCode, gender]);
+
+  useEffect(() => {
+    if (
+      filteredBrowserVoices.length > 0 &&
+      !filteredBrowserVoices.some((v) => v.voiceURI === selectedBrowserVoiceUri)
+    ) {
+      setSelectedBrowserVoiceUri(filteredBrowserVoices[0].voiceURI);
+    }
+  }, [filteredBrowserVoices, selectedBrowserVoiceUri]);
+
+  // Cleanup cached object URL and playback on unmount
+  useEffect(() => {
+    return () => {
+      if (cachedAudioRef.current?.url) {
+        URL.revokeObjectURL(cachedAudioRef.current.url);
+      }
+      if (browserSpeechSupported) {
+        window.speechSynthesis.cancel();
+      }
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+        audioContextRef.current.close().catch(() => {});
+      }
+    };
+  }, [browserSpeechSupported]);
+
+  const stopAllPlayback = useCallback(() => {
+    if (browserSpeechSupported) {
+      window.speechSynthesis.cancel();
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    utteranceRef.current = null;
+    setStatus("idle");
+  }, [browserSpeechSupported]);
+
+  const ensureAudioAnalyser = useCallback(() => {
+    const audioEl = audioRef.current;
+    if (!audioEl) return;
+
+    if (!audioContextRef.current) {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      if (!AudioCtx) return;
+      audioContextRef.current = new AudioCtx();
+    }
+
+    if (audioContextRef.current.state === "suspended") {
+      audioContextRef.current.resume().catch(() => {});
+    }
+
+    if (!mediaSourceConnectedRef.current && audioContextRef.current) {
+      try {
+        const analyser = audioContextRef.current.createAnalyser();
+        analyser.fftSize = 128;
+        const source = audioContextRef.current.createMediaElementSource(audioEl);
+        source.connect(analyser);
+        analyser.connect(audioContextRef.current.destination);
+        analyserRef.current = analyser;
+        mediaSourceConnectedRef.current = true;
+      } catch {
+        // Fallback smoothly to simulated bars if MediaElementSource cannot attach
+      }
+    }
+  }, []);
+
+  const currentCacheKey = useMemo(
+    () =>
+      JSON.stringify({
+        text: text.trim(),
+        languageCode,
+        gender,
+        studioVoiceId,
+        speed: Number(speed.toFixed(2)),
+        pitch: Number(pitch.toFixed(2)),
+      }),
+    [text, languageCode, gender, studioVoiceId, speed, pitch]
+  );
+
+  const synthesizeStudioAudio = useCallback(async () => {
+    if (cachedAudioRef.current?.key === currentCacheKey) {
+      return cachedAudioRef.current;
+    }
+
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: text.trim(),
+        languageCode,
+        languageLabel: selectedLanguage.label,
+        gender,
+        voiceName: studioVoiceId,
+        speed,
+        pitch,
+      }),
+    });
+
+    const payload = await res.json();
+    if (!res.ok) {
+      throw new Error(payload?.error || "Speech synthesis failed.");
+    }
+
+    const binary = atob(payload.audioBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: payload.mimeType || "audio/wav" });
+    const url = URL.createObjectURL(blob);
+
+    if (cachedAudioRef.current?.url) {
+      URL.revokeObjectURL(cachedAudioRef.current.url);
+    }
+
+    const entry = {
+      key: currentCacheKey,
+      url,
+      base64: payload.audioBase64 as string,
+    };
+    cachedAudioRef.current = entry;
+    return entry;
+  }, [currentCacheKey, text, languageCode, selectedLanguage.label, gender, studioVoiceId, speed, pitch]);
+
+  const handlePlay = async () => {
+    setErrorMessage(null);
+    const trimmed = text.trim();
+    if (!trimmed) {
+      onNotify("Please type or paste some text first.", "info");
+      return;
+    }
+
+    // Resume if paused
+    if (status === "paused") {
+      if (engine === "browser" && browserSpeechSupported) {
+        window.speechSynthesis.resume();
+        setStatus("playing");
+        return;
+      }
+      if (engine === "studio" && audioRef.current) {
+        ensureAudioAnalyser();
+        await audioRef.current.play();
+        setStatus("playing");
+        return;
+      }
+    }
+
+    stopAllPlayback();
+
+    if (engine === "browser") {
+      if (!browserSpeechSupported) {
+        setErrorMessage(
+          "Your browser does not support Web Speech synthesis. Switch to Studio AI Voice for playback and downloads."
+        );
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(trimmed);
+      utterance.lang = languageCode;
+      utterance.rate = speed;
+      utterance.pitch = pitch;
+
+      const matchedVoice = browserVoices.find(
+        (v) => v.voiceURI === selectedBrowserVoiceUri
+      );
+      if (matchedVoice) {
+        utterance.voice = matchedVoice;
+      }
+
+      utterance.onstart = () => setStatus("playing");
+      utterance.onend = () => {
+        setStatus("idle");
+        utteranceRef.current = null;
+      };
+      utterance.onerror = () => {
+        setStatus("idle");
+        utteranceRef.current = null;
+        setErrorMessage(
+          "Browser speech playback was interrupted or unavailable for this language. Try Studio AI Voice."
+        );
+      };
+
+      utteranceRef.current = utterance;
+      setStatus("playing");
+      window.speechSynthesis.speak(utterance);
+
+      onSaveHistory({
+        mode: "tts",
+        languageCode,
+        languageLabel: selectedLanguage.label,
+        text: trimmed,
+      });
+      return;
+    }
+
+    // Studio AI Voice mode
+    try {
+      setStatus("loading");
+      const audioEntry = await synthesizeStudioAudio();
+      const audioEl = audioRef.current;
+      if (!audioEl) return;
+
+      audioEl.src = audioEntry.url;
+      audioEl.playbackRate = speed;
+      ensureAudioAnalyser();
+      await audioEl.play();
+      setStatus("playing");
+
+      onSaveHistory({
+        mode: "tts",
+        languageCode,
+        languageLabel: selectedLanguage.label,
+        text: trimmed,
+      });
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Could not synthesize studio audio.";
+      setStatus("idle");
+      setErrorMessage(msg);
+      onNotify(msg, "error");
+    }
+  };
+
+  const handlePause = () => {
+    if (status !== "playing") return;
+    if (engine === "browser" && browserSpeechSupported) {
+      window.speechSynthesis.pause();
+      setStatus("paused");
+    } else if (engine === "studio" && audioRef.current) {
+      audioRef.current.pause();
+      setStatus("paused");
+    }
+  };
+
+  const handleDownloadAudio = async () => {
+    setErrorMessage(null);
+    const trimmed = text.trim();
+    if (!trimmed) {
+      onNotify("Please enter text before downloading audio.", "info");
+      return;
+    }
+
+    try {
+      setIsDownloading(true);
+      const audioEntry = await synthesizeStudioAudio();
+
+      const link = document.createElement("a");
+      link.href = audioEntry.url;
+      link.download = `vaaniai-${languageCode.toLowerCase()}-${Date.now()}.wav`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      onSaveHistory({
+        mode: "tts",
+        languageCode,
+        languageLabel: selectedLanguage.label,
+        text: trimmed,
+      });
+      onNotify("Audio downloaded (.wav)", "success");
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to generate downloadable audio.";
+      setErrorMessage(msg);
+      onNotify(msg, "error");
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  const handleLoadSample = () => {
+    stopAllPlayback();
+    onTextChange(selectedLanguage.sampleText);
+    onNotify(`Loaded ${selectedLanguage.label} sample text`, "info");
+  };
+
+  const handleCopyText = async () => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      onNotify("Nothing to copy yet.", "info");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(trimmed);
+      onNotify("Text copied to clipboard", "success");
+    } catch {
+      onNotify("Could not access clipboard.", "error");
+    }
+  };
+
+  useEffect(() => {
+    if (!actionsRef) return;
+    actionsRef.current = {
+      primaryAction: () => {
+        if (status === "playing") {
+          handlePause();
+        } else if (status !== "loading") {
+          void handlePlay();
+        }
+      },
+      stopAction: () => {
+        if (status === "playing" || status === "paused") {
+          stopAllPlayback();
+        }
+      },
+      downloadAction: () => {
+        if (!isDownloading) {
+          void handleDownloadAudio();
+        }
+      },
+      copyAction: () => {
+        void handleCopyText();
+      },
+    };
+    return () => {
+      actionsRef.current = null;
+    };
+  });
+
+  const charCount = text.length;
+  const isNearLimit = charCount >= MAX_TTS_CHARS * 0.9;
+
+  return (
+    <div className="space-y-6">
+      <audio
+        ref={audioRef}
+        onEnded={() => setStatus("idle")}
+        onError={() => {
+          setStatus("idle");
+          setErrorMessage("Audio playback failed. Please try synthesizing again.");
+        }}
+        className="hidden"
+      />
+
+      {/* Engine & Quick Presets Row */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div
+          className="inline-flex items-center p-1 rounded-xl bg-slate-950/70 border border-white/10"
+          role="group"
+          aria-label="Speech Engine"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              stopAllPlayback();
+              setEngine("studio");
+              setErrorMessage(null);
+            }}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              engine === "studio"
+                ? "bg-indigo-600 text-white shadow-sm"
+                : "text-slate-300 hover:text-white"
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            Studio AI Voice
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              stopAllPlayback();
+              setEngine("browser");
+              setErrorMessage(null);
+            }}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              engine === "browser"
+                ? "bg-indigo-600 text-white shadow-sm"
+                : "text-slate-300 hover:text-white"
+            }`}
+          >
+            <Volume2 className="w-3.5 h-3.5" />
+            Browser Speech
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleLoadSample}
+            className="px-3 py-2 text-xs font-medium text-indigo-200 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-400/20 rounded-lg transition-colors whitespace-nowrap shrink-0"
+          >
+            Insert {selectedLanguage.label.split(" ")[0]} Sample
+          </button>
+          {text.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                stopAllPlayback();
+                onTextChange("");
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-300 hover:text-rose-200 hover:bg-rose-500/15 border border-white/10 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Browser Speech warning if unsupported */}
+      {engine === "browser" && !browserSpeechSupported && (
+        <div
+          role="alert"
+          className="flex items-start gap-3 rounded-xl bg-amber-500/10 border border-amber-400/25 px-4 py-3 text-sm text-amber-100"
+        >
+          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <div>
+            <p className="font-medium">Web Speech Synthesis is not supported here</p>
+            <p className="text-xs text-amber-200/80 mt-0.5">
+              Switch to Studio AI Voice above for natural multilingual audio playback and downloads.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {errorMessage && (
+        <div
+          role="alert"
+          className="flex items-start gap-3 rounded-xl bg-rose-500/10 border border-rose-400/25 px-4 py-3 text-sm text-rose-100"
+        >
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          <p className="leading-snug">{errorMessage}</p>
+        </div>
+      )}
+
+      {/* Textarea Input */}
+      <div className="relative">
+        <label htmlFor="tts-input" className="sr-only">
+          Text to convert to speech
+        </label>
+        <textarea
+          id="tts-input"
+          value={text}
+          onChange={(e) => onTextChange(e.target.value.slice(0, MAX_TTS_CHARS))}
+          maxLength={MAX_TTS_CHARS}
+          rows={6}
+          placeholder="Type or paste Hindi, English, Hinglish, Urdu, Bengali, Tamil, Telugu, or Marathi text here..."
+          className="w-full rounded-xl bg-slate-950/65 border border-white/10 focus:border-indigo-400/60 focus:ring-2 focus:ring-indigo-500/25 px-4 py-3.5 text-base text-slate-100 placeholder:text-slate-500 resize-y min-h-[176px] leading-relaxed outline-none transition-colors"
+        />
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+          <span>
+            Press <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-slate-300 font-mono text-[11px]">Ctrl/⌘ + Enter</kbd> to speak · <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-slate-300 font-mono text-[11px]">?</kbd> for shortcuts
+          </span>
+          <span
+            className={`font-mono ${
+              isNearLimit ? "text-amber-300 font-medium" : "text-slate-400"
+            }`}
+          >
+            {charCount.toLocaleString()} / {MAX_TTS_CHARS.toLocaleString()} chars
+          </span>
+        </div>
+      </div>
+
+      {/* Voice & Language Configuration Grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {/* Language Dropdown */}
+        <div>
+          <label
+            htmlFor="tts-language"
+            className="block text-xs font-medium text-slate-300 mb-1.5"
+          >
+            Language
+          </label>
+          <select
+            id="tts-language"
+            value={languageCode}
+            onChange={(e) => {
+              stopAllPlayback();
+              onLanguageChange(e.target.value);
+            }}
+            className="w-full min-h-[44px] rounded-xl bg-slate-950/75 border border-white/10 focus:border-indigo-400/60 focus:ring-2 focus:ring-indigo-500/25 px-3.5 py-2.5 text-sm text-slate-100 outline-none"
+          >
+            {LANGUAGES.map((lang) => (
+              <option key={lang.code} value={lang.code} className="bg-[#0E1222]">
+                {lang.label} — {lang.nativeName}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Voice Gender */}
+        <div>
+          <span className="block text-xs font-medium text-slate-300 mb-1.5">
+            Voice Profile
+          </span>
+          <div className="grid grid-cols-2 gap-1.5 p-1 min-h-[44px] rounded-xl bg-slate-950/75 border border-white/10">
+            <button
+              type="button"
+              onClick={() => setGender("female")}
+              className={`rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                gender === "female"
+                  ? "bg-indigo-500/25 text-indigo-100 border border-indigo-400/30"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Female
+            </button>
+            <button
+              type="button"
+              onClick={() => setGender("male")}
+              className={`rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                gender === "male"
+                  ? "bg-indigo-500/25 text-indigo-100 border border-indigo-400/30"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Male
+            </button>
+          </div>
+        </div>
+
+        {/* Voice Selection */}
+        <div className="sm:col-span-2 lg:col-span-1">
+          <label
+            htmlFor="tts-voice-select"
+            className="block text-xs font-medium text-slate-300 mb-1.5"
+          >
+            {engine === "studio" ? "Studio Voice" : "System Voice"}
+          </label>
+          {engine === "studio" ? (
+            <select
+              id="tts-voice-select"
+              value={studioVoiceId}
+              onChange={(e) =>
+                setStudioVoiceId(
+                  e.target.value as "Kore" | "Zephyr" | "Puck" | "Charon" | "Fenrir"
+                )
+              }
+              className="w-full min-h-[44px] rounded-xl bg-slate-950/75 border border-white/10 focus:border-indigo-400/60 focus:ring-2 focus:ring-indigo-500/25 px-3.5 py-2.5 text-sm text-slate-100 outline-none"
+            >
+              {STUDIO_VOICES.filter((v) => v.gender === gender).map((voice) => (
+                <option key={voice.id} value={voice.id} className="bg-[#0E1222]">
+                  {voice.name} — {voice.character}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <select
+              id="tts-voice-select"
+              value={selectedBrowserVoiceUri}
+              onChange={(e) => setSelectedBrowserVoiceUri(e.target.value)}
+              disabled={filteredBrowserVoices.length === 0}
+              className="w-full min-h-[44px] rounded-xl bg-slate-950/75 border border-white/10 focus:border-indigo-400/60 focus:ring-2 focus:ring-indigo-500/25 px-3.5 py-2.5 text-sm text-slate-100 outline-none disabled:opacity-50"
+            >
+              {filteredBrowserVoices.length === 0 ? (
+                <option value="" className="bg-[#0E1222]">
+                  Default system voice
+                </option>
+              ) : (
+                filteredBrowserVoices.map((voice) => (
+                  <option
+                    key={voice.voiceURI}
+                    value={voice.voiceURI}
+                    className="bg-[#0E1222]"
+                  >
+                    {voice.name} ({voice.lang})
+                  </option>
+                ))
+              )}
+            </select>
+          )}
+        </div>
+      </div>
+
+      {/* Speed & Pitch Sliders */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 pt-1">
+        <div>
+          <div className="flex items-center justify-between text-xs mb-2">
+            <label htmlFor="tts-speed" className="font-medium text-slate-300">
+              Speed
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-indigo-300 font-medium">
+                {speed.toFixed(2)}x
+              </span>
+              {speed !== 1 && (
+                <button
+                  type="button"
+                  onClick={() => setSpeed(1)}
+                  className="text-slate-400 hover:text-slate-200 transition-colors"
+                  aria-label="Reset speed to 1x"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          </div>
+          <input
+            id="tts-speed"
+            type="range"
+            min={0.5}
+            max={2}
+            step={0.05}
+            value={speed}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              setSpeed(val);
+              if (engine === "studio" && audioRef.current) {
+                audioRef.current.playbackRate = val;
+              }
+            }}
+            className="w-full vaani-slider"
+          />
+          <div className="flex justify-between text-[11px] font-mono text-slate-500 mt-1.5">
+            <span>0.5x</span>
+            <span>1.0x</span>
+            <span>2.0x</span>
+          </div>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between text-xs mb-2">
+            <label htmlFor="tts-pitch" className="font-medium text-slate-300">
+              Pitch
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-indigo-300 font-medium">
+                {pitch.toFixed(1)}
+              </span>
+              {pitch !== 1 && (
+                <button
+                  type="button"
+                  onClick={() => setPitch(1)}
+                  className="text-slate-400 hover:text-slate-200 transition-colors"
+                  aria-label="Reset pitch to 1.0"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          </div>
+          <input
+            id="tts-pitch"
+            type="range"
+            min={0}
+            max={2}
+            step={0.1}
+            value={pitch}
+            onChange={(e) => setPitch(parseFloat(e.target.value))}
+            className="w-full vaani-slider"
+          />
+          <div className="flex justify-between text-[11px] font-mono text-slate-500 mt-1.5">
+            <span>0.0 Low</span>
+            <span>1.0</span>
+            <span>2.0 High</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Transport Action Buttons */}
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-white/10">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {status === "playing" ? (
+            <button
+              type="button"
+              onClick={handlePause}
+              className="inline-flex items-center justify-center gap-2 min-h-[44px] px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold shadow-lg shadow-indigo-600/25 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Pause className="w-4 h-4" />
+              Pause
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handlePlay}
+              disabled={status === "loading"}
+              className="inline-flex items-center justify-center gap-2 min-h-[44px] px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white text-sm font-semibold shadow-lg shadow-indigo-600/25 transition-colors whitespace-nowrap shrink-0"
+            >
+              {status === "loading" ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Synthesizing...
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4" />
+                  {status === "paused" ? "Resume" : "Play Speech"}
+                </>
+              )}
+            </button>
+          )}
+
+          {(status === "playing" || status === "paused") && (
+            <button
+              type="button"
+              onClick={stopAllPlayback}
+              className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 text-sm font-medium transition-colors whitespace-nowrap shrink-0"
+            >
+              <Square className="w-3.5 h-3.5" />
+              Stop
+            </button>
+          )}
+        </div>
+
+        <button
+          type="button"
+          onClick={handleDownloadAudio}
+          disabled={isDownloading}
+          className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2.5 rounded-xl bg-violet-500/15 hover:bg-violet-500/25 border border-violet-400/30 disabled:opacity-60 text-violet-100 text-sm font-medium transition-colors whitespace-nowrap shrink-0"
+        >
+          {isDownloading ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Preparing WAV...
+            </>
+          ) : (
+            <>
+              <Download className="w-4 h-4" />
+              Download Audio (.wav)
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Live Audio Waveform */}
+      <WaveformVisualizer
+        active={status === "playing"}
+        analyser={engine === "studio" ? analyserRef.current : null}
+        simulated={
+          status === "playing" &&
+          (engine === "browser" || !analyserRef.current)
+        }
+        accentColor="indigo"
+        label="Text to speech playback waveform"
+      />
+    </div>
+  );
+}

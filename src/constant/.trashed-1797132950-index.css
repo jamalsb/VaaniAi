@@ -1,0 +1,80 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+    --font-sans: "DM Sans", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    color-scheme: dark;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom studio range sliders */
+input[type="range"].vaani-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(148, 163, 184, 0.2);
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"].vaani-slider:focus-visible {
+  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.35);
+}
+
+input[type="range"].vaani-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #818cf8;
+  border: 2px solid #eef2ff;
+  box-shadow: 0 2px 8px rgba(79, 70, 229, 0.45);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), background-color 150ms ease;
+}
+
+input[type="range"].vaani-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  background: #6366f1;
+}
+
+input[type="range"].vaani-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #818cf8;
+  border: 2px solid #eef2ff;
+  box-shadow: 0 2px 8px rgba(79, 70, 229, 0.45);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), background-color 150ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,538 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { AudioLines, History, Mic, Volume2 } from "lucide-react";
+import { LANGUAGES } from "./constants/languages";
+import {
+  ActivePanelActions,
+  ActiveTab,
+  HistoryEntry,
+  ToastItem,
+  ToastVariant,
+} from "./types";
+import { TextToSpeechPanel } from "./components/TextToSpeechPanel";
+import { SpeechToTextPanel } from "./components/SpeechToTextPanel";
+import { HistoryDrawer } from "./components/HistoryDrawer";
+import { ShortcutGuideModal } from "./components/ShortcutGuideModal";
+import { ToastContainer } from "./components/ToastContainer";
+
+const HISTORY_STORAGE_KEY = "vaaniai_history_v1";
+
+function loadStoredHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<ActiveTab>("tts");
+  const [ttsText, setTtsText] = useState<string>(LANGUAGES[0].sampleText);
+  const [ttsLanguageCode, setTtsLanguageCode] = useState<string>("hi-IN");
+  const [sttTranscript, setSttTranscript] = useState<string>("");
+  const [sttLanguageCode, setSttLanguageCode] = useState<string>("auto");
+  const [history, setHistory] = useState<HistoryEntry[]>(loadStoredHistory);
+  const [historyOpen, setHistoryOpen] = useState<boolean>(false);
+  const [shortcutGuideOpen, setShortcutGuideOpen] = useState<boolean>(false);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const panelActionsRef = useRef<ActivePanelActions | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [history]);
+
+  useEffect(() => {
+    const isEditableElement = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        target.isContentEditable
+      );
+    };
+
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+
+      // '?' opens/closes Shortcut Guide when not typing in an input/textarea/select
+      if (e.key === "?" && !mod && !e.altKey && !isEditableElement(e.target)) {
+        e.preventDefault();
+        setShortcutGuideOpen((prev) => !prev);
+        return;
+      }
+
+      // Ctrl/Cmd + / also toggles Shortcut Guide anywhere
+      if (mod && key === "/") {
+        e.preventDefault();
+        setShortcutGuideOpen((prev) => !prev);
+        return;
+      }
+
+      // Escape closes overlays first, otherwise stops active speech/recording
+      if (e.key === "Escape") {
+        if (shortcutGuideOpen) {
+          e.preventDefault();
+          setShortcutGuideOpen(false);
+          return;
+        }
+        if (historyOpen) {
+          e.preventDefault();
+          setHistoryOpen(false);
+          return;
+        }
+        panelActionsRef.current?.stopAction();
+        return;
+      }
+
+      // Ctrl/Cmd + Enter -> Speak / Pause (TTS) or Start / Stop Recording (STT)
+      if (mod && e.key === "Enter") {
+        e.preventDefault();
+        panelActionsRef.current?.primaryAction();
+        return;
+      }
+
+      // Ctrl/Cmd + Shift + S -> Stop playback / recording
+      if (mod && e.shiftKey && key === "s") {
+        e.preventDefault();
+        panelActionsRef.current?.stopAction();
+        return;
+      }
+
+      // Ctrl/Cmd + D -> Download WAV (TTS) or TXT (STT)
+      if (mod && !e.shiftKey && key === "d") {
+        e.preventDefault();
+        panelActionsRef.current?.downloadAction();
+        return;
+      }
+
+      // Ctrl/Cmd + Shift + C -> Copy active text / transcript
+      if (mod && e.shiftKey && key === "c") {
+        e.preventDefault();
+        panelActionsRef.current?.copyAction();
+        return;
+      }
+
+      // Ctrl/Cmd + H -> Toggle History Drawer
+      if (mod && !e.shiftKey && key === "h") {
+        e.preventDefault();
+        setHistoryOpen((prev) => !prev);
+        return;
+      }
+
+      // Alt + 1 / Alt + 2 -> Switch tabs
+      if (e.altKey && !mod && e.key === "1") {
+        e.preventDefault();
+        setActiveTab("tts");
+        return;
+      }
+      if (e.altKey && !mod && e.key === "2") {
+        e.preventDefault();
+        setActiveTab("stt");
+      }
+    };
+
+    window.addEventListener("keydown", handleGlobalKeyDown);
+    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
+  }, [historyOpen, shortcutGuideOpen]);
+
+  const notify = useCallback(
+    (message: string, variant: ToastVariant = "info") => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setToasts((prev) => [...prev.slice(-3), { id, message, variant }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((item) => item.id !== id));
+      }, 3600);
+    },
+    []
+  );
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const saveHistoryEntry = useCallback(
+    (entry: Omit<HistoryEntry, "id" | "createdAt">) => {
+      const trimmed = entry.text.trim();
+      if (!trimmed) return;
+
+      setHistory((prev) => {
+        const duplicate = prev[0];
+        if (
+          duplicate &&
+          duplicate.mode === entry.mode &&
+          duplicate.text === trimmed
+        ) {
+          return prev;
+        }
+        const next: HistoryEntry = {
+          ...entry,
+          text: trimmed,
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          createdAt: new Date().toISOString(),
+        };
+        return [next, ...prev].slice(0, 25);
+      });
+    },
+    []
+  );
+
+  const handleRestoreHistory = (entry: HistoryEntry) => {
+    if (entry.mode === "tts") {
+      setActiveTab("tts");
+      setTtsLanguageCode(entry.languageCode || "hi-IN");
+      setTtsText(entry.text);
+    } else {
+      setActiveTab("stt");
+      setSttLanguageCode(entry.languageCode || "hi-IN");
+      setSttTranscript(entry.text);
+    }
+    notify("Restored from history", "info");
+  };
+
+  const handleCopyHistoryText = async (content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      notify("Copied to clipboard", "success");
+    } catch {
+      notify("Could not copy text", "error");
+    }
+  };
+
+  const handleExportHistoryJson = () => {
+    if (history.length === 0) {
+      notify("No history entries to export yet.", "info");
+      return;
+    }
+
+    const payload = {
+      app: "VaaniAI",
+      exportedAt: new Date().toISOString(),
+      totalEntries: history.length,
+      entries: history,
+    };
+
+    const json = JSON.stringify(payload, null, 2);
+    const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `vaaniai-history-${dateStamp}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+
+    notify("Exported history backup (.json)", "success");
+  };
+
+  const handleSendSttToTts = (text: string, langCode: string) => {
+    setTtsText(text);
+    if (LANGUAGES.some((l) => l.code === langCode)) {
+      setTtsLanguageCode(langCode);
+    }
+    setActiveTab("tts");
+    notify("Loaded transcript into Text to Speech", "info");
+  };
+
+  const handleQuickLanguageSelect = (code: string) => {
+    const lang = LANGUAGES.find((l) => l.code === code);
+    if (!lang) return;
+    if (activeTab === "tts") {
+      setTtsLanguageCode(code);
+      setTtsText(lang.sampleText);
+    } else {
+      setSttLanguageCode(code);
+    }
+    notify(`Switched language to ${lang.label}`, "info");
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#090B14] text-slate-100 relative overflow-x-hidden">
+      {/* Subtle Ambient Purple/Blue Gradient Mesh */}
+      <div
+        className="pointer-events-none fixed inset-0 overflow-hidden"
+        aria-hidden="true"
+      >
+        <div className="absolute -top-48 left-1/4 w-[640px] h-[640px] rounded-full bg-indigo-600/15 blur-[130px]" />
+        <div className="absolute top-1/3 right-1/6 w-[520px] h-[520px] rounded-full bg-violet-600/12 blur-[130px]" />
+        <div className="absolute -bottom-48 left-1/2 -translate-x-1/2 w-[720px] h-[420px] rounded-full bg-blue-600/10 blur-[140px]" />
+      </div>
+
+      {/* Top Navigation Bar (3-Zone Contract) */}
+      <header className="relative z-20 border-b border-white/10 bg-[#090B14]/75 backdrop-blur-xl">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-8">
+          {/* Zone 1: Brand Wordmark */}
+          <a
+            href="#studio"
+            className="inline-flex items-center gap-2.5 text-lg font-bold tracking-tight text-white font-display whitespace-nowrap shrink-0"
+          >
+            <span className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-md shadow-indigo-500/25">
+              <AudioLines className="w-4 h-4 text-white" />
+            </span>
+            <span>VaaniAI</span>
+          </a>
+
+          {/* Zone 2: Concise Navigation Links */}
+          <nav
+            aria-label="Primary"
+            className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-300"
+          >
+            <button
+              type="button"
+              onClick={() => setActiveTab("tts")}
+              className={`hover:text-white transition-colors whitespace-nowrap shrink-0 ${
+                activeTab === "tts"
+                  ? "text-white underline decoration-indigo-400 decoration-2 underline-offset-8"
+                  : ""
+              }`}
+            >
+              Text to Speech
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("stt")}
+              className={`hover:text-white transition-colors whitespace-nowrap shrink-0 ${
+                activeTab === "stt"
+                  ? "text-white underline decoration-violet-400 decoration-2 underline-offset-8"
+                  : ""
+              }`}
+            >
+              Speech to Text
+            </button>
+            <a
+              href="#languages"
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            >
+              Languages
+            </a>
+            <button
+              type="button"
+              onClick={() => setShortcutGuideOpen(true)}
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            >
+              Shortcuts
+            </button>
+          </nav>
+
+          {/* Zone 3: Single Primary Utility Action */}
+          <div className="flex items-center shrink-0">
+            <button
+              type="button"
+              onClick={() => setHistoryOpen(true)}
+              className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-slate-100 transition-colors whitespace-nowrap shrink-0"
+            >
+              <History className="w-3.5 h-3.5 text-indigo-300" />
+              <span>History</span>
+              {history.length > 0 && (
+                <span className="font-mono text-indigo-300">
+                  ({history.length})
+                </span>
+              )}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Studio Workspace */}
+      <main
+        id="studio"
+        className="relative z-10 flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12 space-y-10"
+      >
+        {/* Clean Editorial Header */}
+        <section className="max-w-2xl space-y-3">
+          <h1
+            className="font-display font-bold tracking-tight text-white leading-[1.15]"
+            style={{
+              fontSize: "clamp(1.85rem, 3.6vw, 2.75rem)",
+              textWrap: "balance",
+            }}
+          >
+            Voice & Text Converter Studio
+          </h1>
+          <p className="text-base text-slate-300 leading-relaxed">
+            Turn Hindi, English, Hinglish, and regional scripts into natural speech, or transcribe live microphone audio in real time.
+          </p>
+        </section>
+
+        {/* Primary Glassmorphic Converter Surface */}
+        <section
+          aria-label="Voice and Text Converter"
+          className="rounded-2xl bg-[#111528]/80 backdrop-blur-2xl border border-white/12 shadow-2xl shadow-black/40 p-5 sm:p-7 space-y-6"
+        >
+          {/* Two Top Tabs: Text to Speech & Speech to Text */}
+          <div
+            role="tablist"
+            aria-label="Converter Mode"
+            className="grid grid-cols-2 gap-2 p-1.5 rounded-xl bg-slate-950/75 border border-white/10"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "tts"}
+              onClick={() => setActiveTab("tts")}
+              className={`flex items-center justify-center gap-2 min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-semibold transition-all duration-150 whitespace-nowrap ${
+                activeTab === "tts"
+                  ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-md shadow-indigo-600/25"
+                  : "text-slate-300 hover:text-white hover:bg-white/5"
+              }`}
+            >
+              <Volume2 className="w-4 h-4 shrink-0" />
+              <span>Text to Speech</span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "stt"}
+              onClick={() => setActiveTab("stt")}
+              className={`flex items-center justify-center gap-2 min-h-[44px] px-4 py-2.5 rounded-lg text-sm font-semibold transition-all duration-150 whitespace-nowrap ${
+                activeTab === "stt"
+                  ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-md shadow-violet-600/25"
+                  : "text-slate-300 hover:text-white hover:bg-white/5"
+              }`}
+            >
+              <Mic className="w-4 h-4 shrink-0" />
+              <span>Speech to Text</span>
+            </button>
+          </div>
+
+          {/* Active Tab Content */}
+          <AnimatePresence mode="wait">
+            {activeTab === "tts" ? (
+              <motion.div
+                key="tts-panel"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+              >
+                <TextToSpeechPanel
+                  text={ttsText}
+                  onTextChange={setTtsText}
+                  languageCode={ttsLanguageCode}
+                  onLanguageChange={setTtsLanguageCode}
+                  onNotify={notify}
+                  onSaveHistory={saveHistoryEntry}
+                  actionsRef={panelActionsRef}
+                />
+              </motion.div>
+            ) : (
+              <motion.div
+                key="stt-panel"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+              >
+                <SpeechToTextPanel
+                  transcript={sttTranscript}
+                  onTranscriptChange={setSttTranscript}
+                  languageCode={sttLanguageCode}
+                  onLanguageChange={setSttLanguageCode}
+                  onSendToTts={handleSendSttToTts}
+                  onNotify={notify}
+                  onSaveHistory={saveHistoryEntry}
+                  actionsRef={panelActionsRef}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </section>
+
+        {/* Supported Languages Quick-Preset Grid */}
+        <section id="languages" className="space-y-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 className="text-base font-semibold text-slate-100 font-display">
+              Supported Languages
+            </h2>
+            <p className="text-xs text-slate-400">
+              Select any language to load it into the active converter
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {LANGUAGES.map((lang) => {
+              const isSelected =
+                activeTab === "tts"
+                  ? ttsLanguageCode === lang.code
+                  : sttLanguageCode === lang.code;
+
+              return (
+                <button
+                  key={lang.code}
+                  type="button"
+                  onClick={() => handleQuickLanguageSelect(lang.code)}
+                  className={`text-left rounded-xl p-3.5 border transition-colors ${
+                    isSelected
+                      ? "bg-indigo-500/15 border-indigo-400/40 text-white"
+                      : "bg-white/[0.02] hover:bg-white/[0.05] border-white/10 text-slate-300"
+                  }`}
+                >
+                  <div className="text-sm font-medium truncate">{lang.label}</div>
+                  <div className="text-xs text-slate-400 mt-0.5 truncate">
+                    {lang.nativeName}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      </main>
+
+      {/* Quiet Footer */}
+      <footer className="relative z-10 border-t border-white/10 py-6 mt-auto">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-400">
+          <span>VaaniAI — Multilingual Voice & Text Studio</span>
+          <div className="flex flex-wrap items-center gap-3">
+            <span>
+              Supports Web Speech APIs, live microphone capture, and WAV & TXT export.
+            </span>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => setShortcutGuideOpen(true)}
+              className="text-slate-300 hover:text-white transition-colors whitespace-nowrap"
+            >
+              Press <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-slate-200 font-mono text-[11px]">?</kbd> for shortcuts
+            </button>
+          </div>
+        </div>
+      </footer>
+
+      <HistoryDrawer
+        open={historyOpen}
+        entries={history}
+        onClose={() => setHistoryOpen(false)}
+        onRestore={handleRestoreHistory}
+        onCopy={handleCopyHistoryText}
+        onDelete={(id) =>
+          setHistory((prev) => prev.filter((item) => item.id !== id))
+        }
+        onExportJson={handleExportHistoryJson}
+        onClearAll={() => {
+          setHistory([]);
+          notify("History cleared", "info");
+        }}
+      />
+
+      <ShortcutGuideModal
+        open={shortcutGuideOpen}
+        onClose={() => setShortcutGuideOpen(false)}
+      />
+
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+    </div>
+  );
+}

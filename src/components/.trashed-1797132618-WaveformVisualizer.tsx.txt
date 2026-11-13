@@ -1,0 +1,149 @@
+import { useEffect, useRef } from "react";
+
+interface WaveformVisualizerProps {
+  active: boolean;
+  analyser?: AnalyserNode | null;
+  simulated?: boolean;
+  accentColor?: "indigo" | "violet";
+  label?: string;
+}
+
+export function WaveformVisualizer({
+  active,
+  analyser = null,
+  simulated = false,
+  accentColor = "indigo",
+  label = "Audio waveform",
+}: WaveformVisualizerProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    let rafId = 0;
+    let phase = 0;
+    const barCount = 44;
+    const smoothed = new Float32Array(barCount).fill(0.08);
+    const freqData = analyser ? new Uint8Array(analyser.frequencyBinCount) : null;
+
+    const renderFrame = () => {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.floor(rect.width));
+      const height = Math.max(1, Math.floor(rect.height));
+
+      if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+      }
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      if (active && analyser && freqData) {
+        analyser.getByteFrequencyData(freqData);
+      }
+
+      const gap = 4;
+      const totalGap = gap * (barCount - 1);
+      const barWidth = Math.max(2, (width - totalGap) / barCount);
+      const centerY = height / 2;
+
+      const grad = ctx.createLinearGradient(0, 0, width, 0);
+      if (accentColor === "violet") {
+        grad.addColorStop(0, "#818cf8");
+        grad.addColorStop(0.5, "#a78bfa");
+        grad.addColorStop(1, "#60a5fa");
+      } else {
+        grad.addColorStop(0, "#6366f1");
+        grad.addColorStop(0.5, "#8b5cf6");
+        grad.addColorStop(1, "#38bdf8");
+      }
+
+      phase += prefersReducedMotion ? 0 : 0.085;
+
+      for (let i = 0; i < barCount; i++) {
+        let target = 0.08;
+
+        if (active) {
+          if (analyser && freqData) {
+            const binStart = Math.floor((i / barCount) * (freqData.length * 0.65));
+            const binEnd = Math.max(
+              binStart + 1,
+              Math.floor(((i + 1) / barCount) * (freqData.length * 0.65))
+            );
+            let sum = 0;
+            for (let b = binStart; b < binEnd; b++) {
+              sum += freqData[b];
+            }
+            const avg = sum / (binEnd - binStart) / 255;
+            target = Math.max(0.1, Math.min(0.95, avg * 1.35));
+          } else if (simulated) {
+            if (prefersReducedMotion) {
+              target = 0.35 + ((i % 3) * 0.12);
+            } else {
+              const envelope = Math.sin((i / barCount) * Math.PI);
+              const waveA = Math.sin(phase * 1.8 + i * 0.42);
+              const waveB = Math.cos(phase * 1.15 - i * 0.27);
+              target = Math.max(
+                0.12,
+                Math.min(0.92, (0.34 + 0.28 * waveA + 0.18 * waveB) * (0.45 + 0.55 * envelope))
+              );
+            }
+          }
+        } else {
+          const idleEnvelope = Math.sin((i / barCount) * Math.PI);
+          target = 0.06 + 0.04 * idleEnvelope;
+        }
+
+        smoothed[i] += (target - smoothed[i]) * 0.28;
+        const barHeight = Math.max(3, smoothed[i] * (height - 8));
+        const x = i * (barWidth + gap);
+        const y = centerY - barHeight / 2;
+
+        ctx.fillStyle = active ? grad : "rgba(148, 163, 184, 0.22)";
+        ctx.beginPath();
+        ctx.roundRect(x, y, barWidth, barHeight, Math.min(barWidth / 2, 4));
+        ctx.fill();
+      }
+
+      if (active && !prefersReducedMotion) {
+        rafId = requestAnimationFrame(renderFrame);
+      } else if (!active) {
+        // Settle cleanly toward idle baseline
+        let needsMore = false;
+        for (let i = 0; i < barCount; i++) {
+          if (Math.abs(smoothed[i] - 0.08) > 0.01) {
+            needsMore = true;
+            break;
+          }
+        }
+        if (needsMore && !prefersReducedMotion) {
+          rafId = requestAnimationFrame(renderFrame);
+        }
+      }
+    };
+
+    renderFrame();
+
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [active, analyser, simulated, accentColor]);
+
+  return (
+    <div
+      className="w-full h-14 rounded-xl bg-slate-950/60 border border-white/8 px-3 flex items-center"
+      aria-label={label}
+    >
+      <canvas ref={canvasRef} className="w-full h-10 block" />
+    </div>
+  );
+}

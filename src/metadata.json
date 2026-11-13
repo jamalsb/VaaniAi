@@ -1,0 +1,6 @@
+{
+  "name": "VaaniAI",
+  "description": "VaaniAI is a multilingual Voice-to-Text and Text-to-Speech studio supporting Hindi, English, Hinglish, Urdu, Bengali, Tamil, Telugu, and Marathi.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
